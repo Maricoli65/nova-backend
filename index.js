@@ -41,7 +41,7 @@ inicializarBaseDeDatos();
 
 app.use(helmet());
 
-const whitelist = ['https://novavenezuela.net', 'https://clenovadigitalstudio.com'];
+const whitelist = ['https://nova-venezuela.net', 'https://clenovadigitalstudio.com'];
 const corsOptions = {
   origin: function (origin, callback) {
     if (!origin || whitelist.indexOf(origin) !== -1) {
