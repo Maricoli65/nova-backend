@@ -59,7 +59,7 @@ app.use(express.json({ limit: '10kb' }));
 app.use(xss());
 
 const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
+  apiKey: (process.env.ANTHROPIC_API_KEY || '').trim(),
 });
 
 async function verificarSesion(req, res, next) {
@@ -294,6 +294,7 @@ app.post('/api/webhook-paypal', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor de Nova corriendo en el puerto ${PORT}`);
 });
+
 
 
 
