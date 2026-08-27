@@ -231,8 +231,8 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
 });
 
 const LIMITES_PLAN = {
-  'basico': 700,
-  'emprendedor': 2000,
+  'basico': 600,
+  'emprendedor': 1700,
   'negocios': 6000
 };
 
