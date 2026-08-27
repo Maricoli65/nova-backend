@@ -100,7 +100,7 @@ app.post('/api/registrar-correo', async (req, res) => {
       return res.status(400).json({ error: 'El correo es obligatorio.' });
     }
     await pool.query(
-      `INSERT INTO usuarios (correo) VALUES ($1) ON CONFLICT (correo) DO NOTHING`,
+      `INSERT INTO usuarios (correo, plan, limite_mensajes, mensajes_usados, creado_en) VALUES ($1, 'prueba', 50, 0, NOW()) ON CONFLICT (correo) DO NOTHING`,
       [correo]
     );
     res.status(200).json({ status: 'success', mensaje: 'Correo registrado' });
@@ -283,6 +283,8 @@ app.post('/api/webhook-paypal', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor de Nova corriendo en el puerto ${PORT}`);
 });
+
+
 
 
 
