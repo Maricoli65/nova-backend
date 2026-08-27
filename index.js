@@ -37,11 +37,11 @@ async function inicializarBaseDeDatos() {
   }
 }
 
-inicializarBaseDeDatos();
+inicializarBaseDeDatos()a
 
 app.use(helmet());
 
-const whitelist = ['https://nova-venezuela.net', 'https://clenovadigitalstudio.com'];
+const whitelist = ['https://novave.net', 'https://clenovadigitalstudio.com'];
 const corsOptions = {
   origin: function (origin, callback) {
     if (!origin || whitelist.indexOf(origin) !== -1) {
