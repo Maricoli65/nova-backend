@@ -100,7 +100,11 @@ app.post('/api/registrar-correo', async (req, res) => {
       return res.status(400).json({ error: 'El correo es obligatorio.' });
     }
     await pool.query(
-      `INSERT INTO usuarios (correo, plan, limite_mensajes, mensajes_usados, creado_en) VALUES ($1, 'prueba', 50, 0, NOW()) ON CONFLICT (correo) DO NOTHING`,
+      `INSERT INTO usuarios (correo, plan, limite_mensajes, mensajes_usados, creado_en)
+       VALUES ($1, 'prueba', 50, 0, NOW())
+       ON CONFLICT (correo) DO UPDATE
+       SET plan = 'prueba', limite_mensajes = 50, mensajes_usados = 0
+       WHERE usuarios.plan = 'ninguno' AND usuarios.clave_hash IS NULL AND usuarios.fecha_pago IS NULL`,
       [correo]
     );
     const resultado = await pool.query(
@@ -217,7 +221,7 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
     }
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-5',
       max_tokens: 1024,
       messages: [{ role: 'user', content: mensaje }],
     });
@@ -290,6 +294,7 @@ app.post('/api/webhook-paypal', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor de Nova corriendo en el puerto ${PORT}`);
 });
+
 
 
 
