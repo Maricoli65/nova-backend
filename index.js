@@ -103,7 +103,14 @@ app.post('/api/registrar-correo', async (req, res) => {
       `INSERT INTO usuarios (correo, plan, limite_mensajes, mensajes_usados, creado_en) VALUES ($1, 'prueba', 50, 0, NOW()) ON CONFLICT (correo) DO NOTHING`,
       [correo]
     );
-    res.status(200).json({ status: 'success', mensaje: 'Correo registrado' });
+    const resultado = await pool.query(
+      `SELECT plan, clave_hash FROM usuarios WHERE correo = $1`,
+      [correo]
+    );
+    const usuario = resultado.rows[0];
+    const planActivo = usuario && usuario.plan !== 'ninguno';
+    const tieneClave = !!(usuario && usuario.clave_hash);
+    res.status(200).json({ status: 'success', mensaje: 'Correo registrado', planActivo: planActivo, tieneClave: tieneClave });
   } catch (error) {
     console.error('Error registrando correo:', error);
     res.status(500).json({ error: 'Error interno del servidor.' });
@@ -283,6 +290,8 @@ app.post('/api/webhook-paypal', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor de Nova corriendo en el puerto ${PORT}`);
 });
+
+
 
 
 
