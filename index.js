@@ -37,7 +37,7 @@ async function inicializarBaseDeDatos() {
   }
 }
 
-inicializarBaseDeDatos()a
+inicializarBaseDeDatos()
 
 app.use(helmet());
 
