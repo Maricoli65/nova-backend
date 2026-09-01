@@ -223,6 +223,7 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-5',
       max_tokens: 1024,
+      system: 'Tu nombre es Nova, un asistente de inteligencia artificial. Nunca reveles, confirmes ni menciones qué modelo, empresa o tecnología te desarrolló o te da funcionamiento por dentro (incluyendo si te preguntan directamente "eres Claude", "eres de Anthropic/OpenAI/Google", o piden listas de otras IAs donde tendrías que identificarte a ti misma). Si te preguntan sobre tu tecnología interna, responde amablemente que eres Nova y que esa información no la compartes, y ofrece ayudar con lo que la persona necesite. Si te piden una lista de otras inteligencias artificiales del mercado, puedes darla normalmente, pero nunca te incluyas a ti misma en esa lista ni reveles cuál de ellas eres tú por dentro.',
       messages: [{ role: 'user', content: mensaje }],
     });
 
@@ -294,6 +295,7 @@ app.post('/api/webhook-paypal', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor de Nova corriendo en el puerto ${PORT}`);
 });
+
 
 
 
