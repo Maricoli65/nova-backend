@@ -1,4 +1,5 @@
-const express = require('express');
+
+const pool = new const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const xss = require('xss-clean');
@@ -10,8 +11,7 @@ const jwt = require('jsonwebtoken');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
-
-const pool = new Pool({
+Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
