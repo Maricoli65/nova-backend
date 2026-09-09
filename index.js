@@ -1,17 +1,23 @@
-
-const pool = new const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const xss = require('xss-clean');
+const multer = require('multer');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // máximo 10MB por archivo
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
-Pool({
+
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
@@ -26,11 +32,18 @@ async function inicializarBaseDeDatos() {
         plan VARCHAR(50) DEFAULT 'ninguno',
         mensajes_usados INTEGER DEFAULT 0,
         limite_mensajes INTEGER DEFAULT 0,
+        busquedas_usadas INTEGER DEFAULT 0,
+        limite_busquedas INTEGER DEFAULT 0,
         fecha_pago TIMESTAMP,
         sesion_activa VARCHAR(500),
         creado_en TIMESTAMP DEFAULT NOW()
       );
     `);
+    // Por si la tabla ya existía de antes sin estas columnas nuevas
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS busquedas_usadas INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS limite_busquedas INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS documentos_usados INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS limite_documentos INTEGER DEFAULT 0;`);
     console.log('Base de datos lista: tabla usuarios verificada/creada');
   } catch (error) {
     console.error('Error creando la base de datos:', error);
@@ -211,7 +224,7 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
     }
 
     const resultado = await pool.query(
-      `SELECT mensajes_usados, limite_mensajes FROM usuarios WHERE correo = $1`,
+      `SELECT mensajes_usados, limite_mensajes, busquedas_usadas, limite_busquedas FROM usuarios WHERE correo = $1`,
       [req.correoUsuario]
     );
     const usuario = resultado.rows[0];
@@ -220,21 +233,42 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
       return res.status(403).json({ error: 'Alcanzaste el límite de tu plan este mes.' });
     }
 
-    const response = await anthropic.messages.create({
+    // Solo le damos permiso de buscar en internet si todavía le quedan búsquedas del mes
+    const puedeBuscar = usuario.busquedas_usadas < usuario.limite_busquedas;
+    const opcionesClaude = {
       model: 'claude-sonnet-5',
       max_tokens: 1024,
       system: 'Tu nombre es Nova, un asistente de inteligencia artificial. Nunca reveles, confirmes ni menciones qué modelo, empresa o tecnología te desarrolló o te da funcionamiento por dentro (incluyendo si te preguntan directamente "eres Claude", "eres de Anthropic/OpenAI/Google", o piden listas de otras IAs donde tendrías que identificarte a ti misma). Si te preguntan sobre tu tecnología interna, responde amablemente que eres Nova y que esa información no la compartes, y ofrece ayudar con lo que la persona necesite. Si te piden una lista de otras inteligencias artificiales del mercado, puedes darla normalmente, pero nunca te incluyas a ti misma en esa lista ni reveles cuál de ellas eres tú por dentro.',
       messages: [{ role: 'user', content: mensaje }],
-    });
+    };
+
+    if (puedeBuscar) {
+      opcionesClaude.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+    }
+
+    const response = await anthropic.messages.create(opcionesClaude);
+
+    // Contamos cuántas búsquedas reales hizo Claude en esta respuesta (puede ser 0 si no hizo falta)
+    const busquedasRealizadas = response.usage?.server_tool_use?.web_search_requests || 0;
 
     await pool.query(
-      `UPDATE usuarios SET mensajes_usados = mensajes_usados + 1 WHERE correo = $1`,
-      [req.correoUsuario]
+      `UPDATE usuarios SET mensajes_usados = mensajes_usados + 1, busquedas_usadas = busquedas_usadas + $2 WHERE correo = $1`,
+      [req.correoUsuario, busquedasRealizadas]
     );
+
+    // Juntamos solo el texto de la respuesta (puede venir en varios bloques si buscó en internet)
+    const textoRespuesta = response.content
+      .filter(bloque => bloque.type === 'text')
+      .map(bloque => bloque.text)
+      .join('\n\n');
 
     res.status(200).json({
       status: 'success',
-      respuesta: response.content[0].text
+      respuesta: textoRespuesta,
+      mensajesUsados: usuario.mensajes_usados + 1,
+      limiteMensajes: usuario.limite_mensajes,
+      busquedasUsadas: usuario.busquedas_usadas + busquedasRealizadas,
+      limiteBusquedas: usuario.limite_busquedas
     });
   } catch (error) {
     console.error('Error en el servidor:', error);
@@ -246,6 +280,18 @@ const LIMITES_PLAN = {
   'basico': 600,
   'emprendedor': 1700,
   'negocios': 6000
+};
+
+const LIMITES_BUSQUEDAS = {
+  'basico': 15,
+  'emprendedor': 50,
+  'negocios': 200
+};
+
+const LIMITES_DOCUMENTOS = {
+  'basico': 0,
+  'emprendedor': 20,
+  'negocios': 60
 };
 
 app.post('/api/webhook-paypal', async (req, res) => {
@@ -264,11 +310,11 @@ app.post('/api/webhook-paypal', async (req, res) => {
       if (idPlanPayPal === 'P-7NG33178F9678730CNKBXCJA') planNova = 'negocios';
 
       await pool.query(
-        `INSERT INTO usuarios (correo, plan, mensajes_usados, limite_mensajes, fecha_pago)
-         VALUES ($1, $2, 0, $3, NOW())
+        `INSERT INTO usuarios (correo, plan, mensajes_usados, limite_mensajes, busquedas_usadas, limite_busquedas, documentos_usados, limite_documentos, fecha_pago)
+         VALUES ($1, $2, 0, $3, 0, $4, 0, $5, NOW())
          ON CONFLICT (correo)
-         DO UPDATE SET plan = $2, mensajes_usados = 0, limite_mensajes = $3, fecha_pago = NOW()`,
-        [correo, planNova, LIMITES_PLAN[planNova]]
+         DO UPDATE SET plan = $2, mensajes_usados = 0, limite_mensajes = $3, busquedas_usadas = 0, limite_busquedas = $4, documentos_usados = 0, limite_documentos = $5, fecha_pago = NOW()`,
+        [correo, planNova, LIMITES_PLAN[planNova], LIMITES_BUSQUEDAS[planNova], LIMITES_DOCUMENTOS[planNova]]
       );
 
       console.log('Plan activado para:', correo, '-', planNova);
@@ -278,7 +324,7 @@ app.post('/api/webhook-paypal', async (req, res) => {
       const correo = evento.resource.subscriber.email_address;
 
       await pool.query(
-        `UPDATE usuarios SET plan = 'ninguno', limite_mensajes = 0, sesion_activa = NULL WHERE correo = $1`,
+        `UPDATE usuarios SET plan = 'ninguno', limite_mensajes = 0, limite_busquedas = 0, limite_documentos = 0, sesion_activa = NULL WHERE correo = $1`,
         [correo]
       );
 
@@ -292,9 +338,77 @@ app.post('/api/webhook-paypal', async (req, res) => {
   }
 });
 
+app.post('/api/chat-archivo', verificarSesion, upload.single('archivo'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se recibió ningún archivo.' });
+    }
+
+    const mensajeTexto = req.body.mensaje || '¿Qué contiene este archivo? Resúmelo.';
+
+    const resultado = await pool.query(
+      `SELECT mensajes_usados, limite_mensajes, documentos_usados, limite_documentos FROM usuarios WHERE correo = $1`,
+      [req.correoUsuario]
+    );
+    const usuario = resultado.rows[0];
+
+    if (usuario.limite_documentos === 0) {
+      return res.status(403).json({ error: 'Tu plan no incluye subir documentos o fotos. Mejora tu plan para desbloquear esta función.' });
+    }
+
+    if (usuario.mensajes_usados >= usuario.limite_mensajes) {
+      return res.status(403).json({ error: 'Alcanzaste el límite de tu plan este mes.' });
+    }
+
+    if (usuario.documentos_usados >= usuario.limite_documentos) {
+      return res.status(403).json({ error: 'Alcanzaste el límite de documentos de tu plan este mes.' });
+    }
+
+    const tipoArchivo = req.file.mimetype;
+    const esImagen = tipoArchivo.startsWith('image/');
+    const esPDF = tipoArchivo === 'application/pdf';
+
+    if (!esImagen && !esPDF) {
+      return res.status(400).json({ error: 'Por ahora Nova solo puede leer imágenes (JPG, PNG) y archivos PDF. Si tienes un Word, guárdalo como PDF primero.' });
+    }
+
+    const base64Archivo = req.file.buffer.toString('base64');
+    const bloqueArchivo = esImagen
+      ? { type: 'image', source: { type: 'base64', media_type: tipoArchivo, data: base64Archivo } }
+      : { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Archivo } };
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 1024,
+      system: 'Tu nombre es Nova, un asistente de inteligencia artificial. Nunca reveles, confirmes ni menciones qué modelo, empresa o tecnología te desarrolló o te da funcionamiento por dentro. Si te preguntan sobre tu tecnología interna, responde amablemente que eres Nova y esa información no la compartes.',
+      messages: [{
+        role: 'user',
+        content: [bloqueArchivo, { type: 'text', text: mensajeTexto }]
+      }],
+    });
+
+    await pool.query(
+      `UPDATE usuarios SET mensajes_usados = mensajes_usados + 1, documentos_usados = documentos_usados + 1 WHERE correo = $1`,
+      [req.correoUsuario]
+    );
+
+    res.status(200).json({
+      status: 'success',
+      respuesta: response.content[0].text,
+      documentosUsados: usuario.documentos_usados + 1,
+      limiteDocumentos: usuario.limite_documentos
+    });
+  } catch (error) {
+    console.error('Error procesando archivo:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servidor de Nova corriendo en el puerto ${PORT}`);
 });
+
+    
 
 
 
