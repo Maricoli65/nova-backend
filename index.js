@@ -245,9 +245,19 @@ function construirSystemConMemoria(resumenMemoria, datosFijados) {
 
 Datos que el usuario pidió explícitamente recordar: ${datosFijados || '(ninguno todavía)'}`;
 
+  // FECHA DEL SERVIDOR: Nova no tiene reloj propio; se le inyecta la fecha/hora
+  // de Venezuela en cada llamada. Va DESPUÉS del bloque con cache para no
+  // invalidar el caché del prompt cada minuto.
+  const fechaVenezuela = new Date().toLocaleString('es-VE', {
+    timeZone: 'America/Caracas',
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true
+  });
+
   return [
     { type: 'text', text: SYSTEM_PROMPT_NOVA },
-    { type: 'text', text: bloqueMemoria, cache_control: { type: 'ephemeral' } }
+    { type: 'text', text: bloqueMemoria, cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: `Fecha y hora actual en Venezuela: ${fechaVenezuela}.` }
   ];
 }
 
@@ -507,6 +517,31 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
       return res.status(403).json({ error: 'Alcanzaste el límite de tu plan este mes.' });
     }
 
+    // COMANDO DE ADMINISTRADORA: si la cuenta admin escribe "/clientes" en el chat,
+    // Nova responde el resumen de clientes por plan directo desde la base de datos.
+    // No llama a la API (costo cero) y no toca la memoria ni los contadores.
+    if (esAdmin && mensaje.trim().toLowerCase() === '/clientes') {
+      const NOMBRES_PLAN = { emprendedor: 'Pro', negocios: 'Plus', basico: 'Básico', prueba: 'Prueba gratis', ninguno: 'Sin plan (cancelados)' };
+      const conteo = await pool.query(
+        `SELECT plan, COUNT(*)::int AS cantidad FROM usuarios GROUP BY plan ORDER BY cantidad DESC`
+      );
+      let totalClientes = 0;
+      const lineas = conteo.rows.map(fila => {
+        totalClientes += fila.cantidad;
+        const nombre = NOMBRES_PLAN[fila.plan] || fila.plan;
+        return `• ${nombre}: ${fila.cantidad}`;
+      });
+      const resumenClientes = `📊 Resumen de clientes por plan\n\n${lineas.join('\n')}\n\nTotal de cuentas: ${totalClientes}`;
+      return res.status(200).json({
+        status: 'success',
+        respuesta: resumenClientes,
+        mensajesUsados: usuario.mensajes_usados,
+        limiteMensajes: usuario.limite_mensajes,
+        busquedasUsadas: usuario.busquedas_usadas,
+        limiteBusquedas: usuario.limite_busquedas
+      });
+    }
+
     if (detectarPeticionDeRecordar(mensaje)) {
       await guardarDatoFijado(req.correoUsuario, mensaje);
     }
@@ -540,6 +575,23 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
       .map(bloque => bloque.text)
       .join('\n\n');
 
+    // FUENTES DE BÚSQUEDA: la API ya devuelve qué páginas consultó Nova
+    // (antes el backend las descartaba). Se recogen de las citas de la
+    // respuesta, sin repetir, máximo 8, y se envían al navegador para
+    // que el frontend las dibuje debajo de la respuesta.
+    const fuentes = [];
+    const urlsVistas = new Set();
+    for (const bloque of response.content) {
+      if (bloque.type === 'text' && Array.isArray(bloque.citations)) {
+        for (const cita of bloque.citations) {
+          if (cita.url && !urlsVistas.has(cita.url) && fuentes.length < 8) {
+            urlsVistas.add(cita.url);
+            fuentes.push({ titulo: cita.title || cita.url, url: cita.url });
+          }
+        }
+      }
+    }
+
     actualizarMemoriaTrasIntercambio(
       req.correoUsuario,
       mensaje,
@@ -552,6 +604,7 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
     res.status(200).json({
       status: 'success',
       respuesta: textoRespuesta,
+      fuentes: fuentes,
       mensajesUsados: usuario.mensajes_usados + 1,
       limiteMensajes: usuario.limite_mensajes,
       busquedasUsadas: usuario.busquedas_usadas + busquedasRealizadas,
