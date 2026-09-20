@@ -85,6 +85,24 @@ async function inicializarBaseDeDatos() {
     // Para congelar una cuenta específica en caso de robo de clave o abuso, sin apagar el resto de Nova
     await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cuenta_bloqueada BOOLEAN DEFAULT FALSE;`);
 
+    // --- Tanda 3 (20 sept 2026): Mi cuenta + historial de chats ---
+    // Nombre del cliente (opcional, lo escribe él mismo en la pantalla Mi cuenta)
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nombre VARCHAR(60) DEFAULT '';`);
+    // Apunta al chat que el usuario tiene abierto ahora mismo (NULL = todavía no hay)
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS conversacion_activa INTEGER;`);
+    // Tabla de conversaciones guardadas: cada chat del usuario, con todos sus mensajes
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conversaciones (
+        id SERIAL PRIMARY KEY,
+        correo VARCHAR(255) NOT NULL,
+        titulo VARCHAR(120) NOT NULL,
+        mensajes JSONB DEFAULT '[]'::jsonb,
+        creado_en TIMESTAMP DEFAULT NOW(),
+        actualizado_en TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_conversaciones_correo ON conversaciones (correo, actualizado_en DESC);`);
+
     console.log('Base de datos lista: tabla usuarios verificada/creada');
   } catch (error) {
     console.error('Error creando la base de datos:', error);
@@ -240,10 +258,55 @@ async function actualizarMemoriaTrasIntercambio(correo, mensajeUsuario, respuest
   }
 }
 
-function construirSystemConMemoria(resumenMemoria, datosFijados) {
+// ============================================
+// HISTORIAL DE CHATS (Tanda 3, 20 sept 2026)
+// ============================================
+// Cada intercambio se guarda también en la conversación activa del usuario,
+// para que pueda ver y reabrir sus chats anteriores desde el panel de las
+// tres rayitas. Corre en segundo plano: si falla, se anota el error en los
+// logs pero la respuesta al cliente no se afecta.
+
+function generarTituloDeChat(mensaje) {
+  const limpio = (mensaje || '').replace(/\s+/g, ' ').trim();
+  if (limpio.length <= 40) return limpio || 'Nueva conversación';
+  return limpio.slice(0, 40).trim() + '…';
+}
+
+async function guardarEnConversacion(correo, conversacionActiva, mensajeUsuario, respuestaNova) {
+  const nuevosMensajes = [
+    { rol: 'usuario', texto: mensajeUsuario },
+    { rol: 'nova', texto: respuestaNova }
+  ];
+
+  if (conversacionActiva) {
+    const resultado = await pool.query(
+      `UPDATE conversaciones
+       SET mensajes = mensajes || $1::jsonb, actualizado_en = NOW()
+       WHERE id = $2 AND correo = $3`,
+      [JSON.stringify(nuevosMensajes), conversacionActiva, correo]
+    );
+    if (resultado.rowCount > 0) return;
+    // Si la conversación activa ya no existe (la borró desde otro dispositivo),
+    // se cae aquí abajo y se crea una nueva con este intercambio
+  }
+
+  // Primer mensaje de un chat nuevo: nace la conversación y su título
+  const creada = await pool.query(
+    `INSERT INTO conversaciones (correo, titulo, mensajes) VALUES ($1, $2, $3::jsonb) RETURNING id`,
+    [correo, generarTituloDeChat(mensajeUsuario), JSON.stringify(nuevosMensajes)]
+  );
+  await pool.query(
+    `UPDATE usuarios SET conversacion_activa = $1 WHERE correo = $2`,
+    [creada.rows[0].id, correo]
+  );
+}
+
+function construirSystemConMemoria(resumenMemoria, datosFijados, nombreUsuario) {
   const bloqueMemoria = `Resumen de la conversación con este usuario hasta ahora: ${resumenMemoria || '(sin resumen todavía, es de las primeras conversaciones)'}
 
-Datos que el usuario pidió explícitamente recordar: ${datosFijados || '(ninguno todavía)'}`;
+Datos que el usuario pidió explícitamente recordar: ${datosFijados || '(ninguno todavía)'}
+
+Nombre del usuario (si lo indicó en su cuenta, úsalo con naturalidad para dirigirte a él): ${nombreUsuario || '(no lo ha indicado)'}`;
 
   // FECHA DEL SERVIDOR: Nova no tiene reloj propio; se le inyecta la fecha/hora
   // de Venezuela en cada llamada. Va DESPUÉS del bloque con cache para no
@@ -487,7 +550,7 @@ app.post('/api/cerrar-sesion', verificarSesion, async (req, res) => {
 app.post('/api/nuevo-chat', verificarSesion, async (req, res) => {
   try {
     await pool.query(
-      `UPDATE usuarios SET historial_reciente = '[]'::jsonb, contador_intercambios = 0 WHERE correo = $1`,
+      `UPDATE usuarios SET historial_reciente = '[]'::jsonb, contador_intercambios = 0, conversacion_activa = NULL WHERE correo = $1`,
       [req.correoUsuario]
     );
     res.status(200).json({ status: 'success', mensaje: 'Nuevo chat iniciado.' });
@@ -506,7 +569,8 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
 
     const resultado = await pool.query(
       `SELECT mensajes_usados, limite_mensajes, busquedas_usadas, limite_busquedas,
-              resumen_memoria, datos_fijados, historial_reciente, contador_intercambios, es_admin
+              resumen_memoria, datos_fijados, historial_reciente, contador_intercambios, es_admin,
+              nombre, conversacion_activa
        FROM usuarios WHERE correo = $1`,
       [req.correoUsuario]
     );
@@ -553,7 +617,7 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
     const opcionesClaude = {
       model: 'claude-sonnet-5',
       max_tokens: 1024,
-      system: construirSystemConMemoria(usuario.resumen_memoria, usuario.datos_fijados),
+      system: construirSystemConMemoria(usuario.resumen_memoria, usuario.datos_fijados, usuario.nombre),
       messages: construirMensajesConHistorial(historialReciente, mensaje),
     };
 
@@ -600,6 +664,9 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
       historialReciente,
       usuario.contador_intercambios || 0
     ).catch(error => console.error('Error actualizando memoria:', error));
+
+    guardarEnConversacion(req.correoUsuario, usuario.conversacion_activa, mensaje, textoRespuesta)
+      .catch(error => console.error('Error guardando en conversación:', error));
 
     res.status(200).json({
       status: 'success',
@@ -685,7 +752,8 @@ app.post('/api/chat-archivo', verificarSesion, upload.single('archivo'), async (
 
     const resultado = await pool.query(
       `SELECT mensajes_usados, limite_mensajes, documentos_usados, limite_documentos, es_admin,
-              resumen_memoria, datos_fijados, historial_reciente, contador_intercambios
+              resumen_memoria, datos_fijados, historial_reciente, contador_intercambios,
+              nombre, conversacion_activa
        FROM usuarios WHERE correo = $1`,
       [req.correoUsuario]
     );
@@ -722,7 +790,7 @@ app.post('/api/chat-archivo', verificarSesion, upload.single('archivo'), async (
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-5',
       max_tokens: 1024,
-      system: construirSystemConMemoria(usuario.resumen_memoria, usuario.datos_fijados),
+      system: construirSystemConMemoria(usuario.resumen_memoria, usuario.datos_fijados, usuario.nombre),
       messages: construirMensajesConHistorial(historialReciente, [bloqueArchivo, { type: 'text', text: mensajeTexto }]),
     });
 
@@ -746,6 +814,9 @@ app.post('/api/chat-archivo', verificarSesion, upload.single('archivo'), async (
       usuario.contador_intercambios || 0
     ).catch(error => console.error('Error actualizando memoria:', error));
 
+    guardarEnConversacion(req.correoUsuario, usuario.conversacion_activa, `[Subió ${nombreArchivo}] ${mensajeTexto}`, textoRespuesta)
+      .catch(error => console.error('Error guardando en conversación:', error));
+
     res.status(200).json({
       status: 'success',
       respuesta: textoRespuesta,
@@ -754,6 +825,147 @@ app.post('/api/chat-archivo', verificarSesion, upload.single('archivo'), async (
     });
   } catch (error) {
     console.error('Error procesando archivo:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
+// ============================================
+// MI CUENTA + HISTORIAL DE CHATS (Tanda 3, 20 sept 2026)
+// ============================================
+
+// Datos de la pantalla "Mi cuenta": nombre, plan, uso del mes y fechas
+app.get('/api/mi-cuenta', verificarSesion, async (req, res) => {
+  try {
+    const resultado = await pool.query(
+      `SELECT nombre, correo, plan, fecha_pago, creado_en,
+              mensajes_usados, limite_mensajes, busquedas_usadas, limite_busquedas,
+              documentos_usados, limite_documentos, es_admin
+       FROM usuarios WHERE correo = $1`,
+      [req.correoUsuario]
+    );
+    const u = resultado.rows[0];
+    const NOMBRES_PLAN_CUENTA = { emprendedor: 'Nova Pro', negocios: 'Nova Plus', basico: 'Nova Básico', prueba: 'Prueba gratis', ninguno: 'Sin plan activo' };
+    res.status(200).json({
+      status: 'success',
+      nombre: u.nombre || '',
+      correo: u.correo,
+      plan: NOMBRES_PLAN_CUENTA[u.plan] || u.plan,
+      fechaPago: u.fecha_pago,
+      miembroDesde: u.creado_en,
+      esAdmin: u.es_admin === true,
+      uso: {
+        mensajesUsados: u.mensajes_usados,
+        limiteMensajes: u.limite_mensajes,
+        busquedasUsadas: u.busquedas_usadas,
+        limiteBusquedas: u.limite_busquedas,
+        documentosUsados: u.documentos_usados,
+        limiteDocumentos: u.limite_documentos
+      }
+    });
+  } catch (error) {
+    console.error('Error obteniendo Mi cuenta:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
+// Guardar o cambiar el nombre del cliente (opcional; vacío = borrarlo)
+app.post('/api/mi-cuenta/nombre', verificarSesion, async (req, res) => {
+  try {
+    const nombre = String(req.body.nombre || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    await pool.query(`UPDATE usuarios SET nombre = $1 WHERE correo = $2`, [nombre, req.correoUsuario]);
+    res.status(200).json({ status: 'success', nombre: nombre });
+  } catch (error) {
+    console.error('Error guardando nombre:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
+// Lista de chats del usuario, del más reciente al más viejo (panel de las tres rayitas)
+app.get('/api/conversaciones', verificarSesion, async (req, res) => {
+  try {
+    const resultado = await pool.query(
+      `SELECT id, titulo, actualizado_en FROM conversaciones
+       WHERE correo = $1 ORDER BY actualizado_en DESC LIMIT 50`,
+      [req.correoUsuario]
+    );
+    res.status(200).json({ status: 'success', conversaciones: resultado.rows });
+  } catch (error) {
+    console.error('Error listando conversaciones:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
+// Reabrir un chat anterior: se pinta completo en pantalla, se vuelve la conversación
+// activa, y Nova recupera los últimos 10 intercambios de ese hilo como contexto vivo
+// (la memoria de largo plazo y "recuérdame esto" no se tocan)
+app.post('/api/abrir-chat', verificarSesion, async (req, res) => {
+  try {
+    const id = parseInt(req.body.id, 10);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: 'Falta el chat que quieres abrir.' });
+    }
+
+    const resultado = await pool.query(
+      `SELECT id, titulo, mensajes FROM conversaciones WHERE id = $1 AND correo = $2`,
+      [id, req.correoUsuario]
+    );
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({ error: 'Ese chat no existe.' });
+    }
+    const conversacion = resultado.rows[0];
+    const mensajes = conversacion.mensajes || [];
+
+    // Se rearman los pares usuario→Nova y se toman los últimos 10 como hilo vivo
+    const intercambios = [];
+    for (let i = 0; i + 1 < mensajes.length; i += 2) {
+      if (mensajes[i].rol === 'usuario' && mensajes[i + 1].rol === 'nova') {
+        intercambios.push({ usuario: mensajes[i].texto, nova: mensajes[i + 1].texto });
+      }
+    }
+    const ultimosIntercambios = intercambios.slice(-10);
+
+    await pool.query(
+      `UPDATE usuarios SET conversacion_activa = $1, historial_reciente = $2, contador_intercambios = 0 WHERE correo = $3`,
+      [conversacion.id, JSON.stringify(ultimosIntercambios), req.correoUsuario]
+    );
+
+    res.status(200).json({
+      status: 'success',
+      id: conversacion.id,
+      titulo: conversacion.titulo,
+      mensajes: mensajes
+    });
+  } catch (error) {
+    console.error('Error abriendo chat:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
+// Borrar un chat del historial; si era el que estaba abierto, el hilo vivo también se reinicia
+app.post('/api/borrar-chat', verificarSesion, async (req, res) => {
+  try {
+    const id = parseInt(req.body.id, 10);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: 'Falta el chat que quieres borrar.' });
+    }
+
+    const resultado = await pool.query(
+      `DELETE FROM conversaciones WHERE id = $1 AND correo = $2 RETURNING id`,
+      [id, req.correoUsuario]
+    );
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({ error: 'Ese chat no existe.' });
+    }
+
+    await pool.query(
+      `UPDATE usuarios SET conversacion_activa = NULL, historial_reciente = '[]'::jsonb, contador_intercambios = 0
+       WHERE correo = $1 AND conversacion_activa = $2`,
+      [req.correoUsuario, id]
+    );
+
+    res.status(200).json({ status: 'success', mensaje: 'Chat eliminado.' });
+  } catch (error) {
+    console.error('Error borrando chat:', error);
     res.status(500).json({ error: 'Error interno del servidor.' });
   }
 });
