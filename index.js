@@ -43,7 +43,7 @@ const pool = new Pool({
 const SYSTEM_PROMPT_NOVA = 'Tu nombre es Nova, un asistente de inteligencia artificial. Tu tono es profesional, cálido y claro, como el de un asistente serio de nivel corporativo. No uses emojis ni emoticonos en tus respuestas, salvo que el usuario los use primero y el contexto lo amerite; incluso en ese caso, úsalos con mucha moderación. Esta regla es estricta: aunque tus respuestas anteriores en esta misma conversación contengan emojis, NO los imites — de ahora en adelante responde siempre sin emojis. Nunca reveles, confirmes ni menciones qué modelo, empresa o tecnología te desarrolló o te da funcionamiento por dentro (incluyendo si te preguntan directamente "eres Claude", "eres de Anthropic/OpenAI/Google", o piden listas de otras IAs donde tendrías que identificarte a ti misma). Si te preguntan sobre tu tecnología interna, responde amablemente que eres Nova y que esa información no la compartes, y ofrece ayudar con lo que la persona necesite. Si te piden una lista de otras inteligencias artificiales del mercado, puedes darla normalmente, pero nunca te incluyas a ti misma en esa lista ni reveles cuál de ellas eres tú por dentro.';
 
 // Cuántos intercambios (usuario+Nova) se guardan tal cual antes de resumirlos
-const INTERCAMBIOS_ANTES_DE_RESUMIR = 10;
+const INTERCAMBIOS_ANTES_DE_RESUMIR = 6;
 
 async function inicializarBaseDeDatos() {
   try {
@@ -348,10 +348,10 @@ app.post('/api/registrar-correo', async (req, res) => {
       return res.status(400).json({ error: 'El correo es obligatorio.' });
     }
     await pool.query(
-      `INSERT INTO usuarios (correo, plan, limite_mensajes, mensajes_usados, creado_en)
-       VALUES ($1, 'prueba', 50, 0, NOW())
+      `INSERT INTO usuarios (correo, plan, limite_mensajes, mensajes_usados, limite_busquedas, busquedas_usadas, creado_en)
+       VALUES ($1, 'prueba', 30, 0, 10, 0, NOW())
        ON CONFLICT (correo) DO UPDATE
-       SET plan = 'prueba', limite_mensajes = 50, mensajes_usados = 0
+       SET plan = 'prueba', limite_mensajes = 30, mensajes_usados = 0, limite_busquedas = 10, busquedas_usadas = 0
        WHERE usuarios.plan = 'ninguno' AND usuarios.clave_hash IS NULL AND usuarios.fecha_pago IS NULL`,
       [correo]
     );
@@ -616,7 +616,7 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
 
     const opcionesClaude = {
       model: 'claude-sonnet-5',
-      max_tokens: 1024,
+      max_tokens: 700,
       system: construirSystemConMemoria(usuario.resumen_memoria, usuario.datos_fijados, usuario.nombre),
       messages: construirMensajesConHistorial(historialReciente, mensaje),
     };
@@ -684,18 +684,18 @@ app.post('/api/chat', verificarSesion, async (req, res) => {
 });
 
 const LIMITES_PLAN = {
-  'emprendedor': 1700,
-  'negocios': 6000
+  'emprendedor': 340,
+  'negocios': 550
 };
 
 const LIMITES_BUSQUEDAS = {
-  'emprendedor': 50,
-  'negocios': 200
+  'emprendedor': 25,
+  'negocios': 100
 };
 
 const LIMITES_DOCUMENTOS = {
-  'emprendedor': 20,
-  'negocios': 60
+  'emprendedor': 10,
+  'negocios': 30
 };
 
 app.post('/api/webhook-paypal', async (req, res) => {
@@ -789,7 +789,7 @@ app.post('/api/chat-archivo', verificarSesion, upload.single('archivo'), async (
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-5',
-      max_tokens: 1024,
+      max_tokens: 700,
       system: construirSystemConMemoria(usuario.resumen_memoria, usuario.datos_fijados, usuario.nombre),
       messages: construirMensajesConHistorial(historialReciente, [bloqueArchivo, { type: 'text', text: mensajeTexto }]),
     });
@@ -922,7 +922,7 @@ app.post('/api/abrir-chat', verificarSesion, async (req, res) => {
         intercambios.push({ usuario: mensajes[i].texto, nova: mensajes[i + 1].texto });
       }
     }
-    const ultimosIntercambios = intercambios.slice(-10);
+    const ultimosIntercambios = intercambios.slice(-6);
 
     await pool.query(
       `UPDATE usuarios SET conversacion_activa = $1, historial_reciente = $2, contador_intercambios = 0 WHERE correo = $3`,
